@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const EventEmitter = require('events');
 const { getRamMB } = require('./serverConfig');
+const { findServerJar, isForgeServer } = require('./scan');
 
 const MAX_LOG_LINES = 500;
 
@@ -79,6 +80,29 @@ class ProcessManager extends EventEmitter {
     });
   }
 
+  // Picks the jar that should actually be launched.
+  //
+  // Fabric/Quilt servers have a launcher jar that wraps the vanilla
+  // server and loads mods. It can be named fabric-server-launch.jar
+  // (installer-generated) or something like fabricserver-1.21.4.jar
+  // (older/downloaded launcher), and launching the vanilla server.jar
+  // instead would skip every mod. So: exact known names first, then any
+  // jar with "fabric" or "quilt" in its name, then whatever jar
+  // scan.js identified as the server (Paper, vanilla, ...).
+  findLaunchJar(serverPath) {
+    for (const jar of ['fabric-server-launch.jar', 'quilt-server-launch.jar']) {
+      if (fs.existsSync(path.join(serverPath, jar))) return jar;
+    }
+
+    try {
+      const loaderJar = fs.readdirSync(serverPath)
+        .find((f) => /\.jar$/i.test(f) && /fabric|quilt/i.test(f));
+      if (loaderJar) return loaderJar;
+    } catch { /* fall through */ }
+
+    return findServerJar(serverPath) || 'server.jar';
+  }
+
   // Prefer an existing start.bat/run.bat in the server's own folder (it
   // likely already has memory flags and other settings tuned) and only
   // fall back to a plain launch if neither exists.
@@ -89,9 +113,14 @@ class ProcessManager extends EventEmitter {
   // tuning, Aikar's flags, etc.) get bypassed for as long as the
   // override is set. Clearing the override (leave the RAM field blank
   // in the dashboard) goes back to using the bat file as-is.
+  //
+  // Forge/NeoForge servers are the exception: they don't run via
+  // `java -jar`, so the RAM override is ignored for them and they
+  // always launch through their own run.bat.
   buildLaunchCommand(serverPath, ramMB) {
-    if (ramMB) {
-      return { command: 'java', args: [`-Xmx${ramMB}M`, `-Xms${ramMB}M`, '-jar', 'server.jar', 'nogui'] };
+    if (ramMB && !isForgeServer(serverPath)) {
+      const jar = this.findLaunchJar(serverPath);
+      return { command: 'java', args: [`-Xmx${ramMB}M`, `-Xms${ramMB}M`, '-jar', jar, 'nogui'] };
     }
     if (fs.existsSync(path.join(serverPath, 'start.bat'))) {
       return { command: 'cmd.exe', args: ['/c', 'start.bat'] };
@@ -99,7 +128,7 @@ class ProcessManager extends EventEmitter {
     if (fs.existsSync(path.join(serverPath, 'run.bat'))) {
       return { command: 'cmd.exe', args: ['/c', 'run.bat'] };
     }
-    return { command: 'java', args: ['-jar', 'server.jar', 'nogui'] };
+    return { command: 'java', args: ['-jar', this.findLaunchJar(serverPath), 'nogui'] };
   }
 
   start(name) {

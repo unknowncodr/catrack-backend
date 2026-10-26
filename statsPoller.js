@@ -8,6 +8,35 @@ const pidusage = require('pidusage');
 const mcping = require('./mcping');
 const { descendantPids } = require('./processTree');
 
+const { exec } = require('child_process');
+
+// Windows: wmic is gone on newer builds, so read per-process CPU/RAM
+// through PowerShell/CIM instead (same approach as processTree.js).
+function sampleUsageWindows(pids) {
+  return new Promise((resolve) => {
+    const list = pids.join(',');
+    const cmd = 'powershell -NoProfile -NonInteractive -Command '
+      + `"Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | `
+      + `Where-Object { @(${list}) -contains $_.IDProcess } | `
+      + `Select-Object PercentProcessorTime,WorkingSetPrivate | ConvertTo-Json -Compress"`;
+    exec(cmd, { windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err || !stdout.trim()) return resolve(null);
+      try {
+        let rows = JSON.parse(stdout);
+        if (!Array.isArray(rows)) rows = [rows];
+        const cpu = rows.reduce((s, r) => s + (r.PercentProcessorTime || 0), 0);
+        const mem = rows.reduce((s, r) => s + (r.WorkingSetPrivate || 0), 0);
+        resolve({
+          cpu: Math.round(cpu * 10) / 10,
+          memoryMB: Math.round(mem / 1024 / 1024),
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
 const DEFAULT_INTERVAL_MS = 4000;
 const PING_TIMEOUT_MS = 2500;
 
@@ -87,10 +116,16 @@ class StatsPoller extends EventEmitter {
   // java process using the CPU/RAM is a child or grandchild of it).
   async sampleUsage(rootPid) {
     const pids = await descendantPids(rootPid);
+
+    if (process.platform === 'win32') {
+      return sampleUsageWindows(pids);
+    }
+    
     let stats;
     try {
       stats = await pidusage(pids);
-    } catch {
+    } catch (err) {
+      console.log('[stats] pidusage failed:', err.message);
       return null;
     }
     // pidusage(array) always resolves to {pid: statsOrNull, ...}, even
@@ -127,3 +162,4 @@ class StatsPoller extends EventEmitter {
 }
 
 module.exports = StatsPoller;
+
