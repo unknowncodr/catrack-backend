@@ -134,7 +134,14 @@ function readVersion(serverPath) {
     return 'unknown';
   }
 }
-
+function readIcon(serverPath) {
+  try {
+    const file = path.join(serverPath, 'server-icon.png');
+    return 'data:image/png;base64,' + fs.readFileSync(file).toString('base64');
+  } catch {
+    return null;
+  }
+}
 // A folder counts as a server if it contains a server jar (any name) or
 // is a Forge/NeoForge server (run.bat + libraries/). This deliberately
 // skips host-agent itself and any other non-server folder (backups,
@@ -157,6 +164,7 @@ function scanServers(isRunningFn = () => false) {
       version: readVersion(serverPath),
       port: readPort(serverPath),
       ramMB: getRamMB(serverPath), // null = no override, using start.bat/run.bat/plain java
+      icon: readIcon(serverPath),
       status: isRunningFn(entry.name) ? 'online' : 'offline',
     });
   }
@@ -164,4 +172,4 @@ function scanServers(isRunningFn = () => false) {
   return servers;
 }
 
-module.exports = { scanServers, SERVERS_DIR, findServerJar, isForgeServer };
+module.exports = { scanServers, SERVERS_DIR, findServerJar, isForgeServer, readIcon };
