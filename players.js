@@ -27,6 +27,18 @@ function knownPlayers(serverPath) {
   return cache.map((p) => ({ name: p.name, uuid: p.uuid }));
 }
 
+// Only plain numbers and strings are copied out of the NBT, so the
+// result is always safe to JSON.stringify (no BigInt surprises).
+function simplifyItems(list) {
+  return (Array.isArray(list) ? list : [])
+    .filter((it) => it && typeof it.id === 'string')
+    .map((it) => ({
+      slot: it.Slot,
+      id: it.id,
+      count: it.count ?? it.Count ?? 1, // 'count' since 1.20.5, 'Count' before
+    }));
+}
+
 async function readPlayer(serverPath, uuid) {
   if (!/^[0-9a-f-]{32,36}$/i.test(uuid)) return null; // also blocks path tricks
   const world = worldDir(serverPath);
@@ -41,7 +53,7 @@ async function readPlayer(serverPath, uuid) {
     path.join(world, 'players', 'stats', `${uuid}.json`),
   ]);
 
-  const out = { uuid, hasData: false, stats: null };
+  const out = { uuid, hasData: false, stats: null, inventory: [], enderchest: [] };
 
   if (datFile) {
     try {
@@ -57,6 +69,22 @@ async function readPlayer(serverPath, uuid) {
       out.food = d.foodLevel ?? null;
       out.xpLevel = d.XpLevel ?? null;
       out.gameMode = d.playerGameType ?? null;
+
+      // Slots: 0-8 hotbar, 9-35 main inventory, 100 boots, 101 leggings,
+      // 102 chestplate, 103 helmet, -106 offhand.
+      out.inventory = simplifyItems(d.Inventory);
+      out.enderchest = simplifyItems(d.EnderItems);
+
+      // Newer versions may keep armor/offhand in an `equipment` compound.
+      if (d.equipment && typeof d.equipment === 'object') {
+        const map = { feet: 100, legs: 101, chest: 102, head: 103, offhand: -106 };
+        for (const [key, slot] of Object.entries(map)) {
+          const it = d.equipment[key];
+          if (it && typeof it.id === 'string' && !out.inventory.some((x) => x.slot === slot)) {
+            out.inventory.push({ slot, id: it.id, count: it.count ?? it.Count ?? 1 });
+          }
+        }
+      }
     } catch (err) {
       console.log(`Could not read ${datFile}:`, err.message);
     }
