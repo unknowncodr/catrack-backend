@@ -1,7 +1,13 @@
 // Periodically gathers the "live" stats the dashboard shows for each
 // running server — player count/names, server icon, CPU/RAM, uptime,
-// and (best-effort, if enabled) TPS — and emits one 'stats' event per
-// server per tick. server.js broadcasts each of these to clients.
+// and TPS/MSPT (via vanilla's `tick query`, 1.20.3+) — and emits one
+// 'stats' event per server per tick. server.js broadcasts each of
+// these to clients.
+//
+// Also keeps a short rolling history per server (for the dashboard
+// graphs), and only polls TPS for servers somebody is actually looking
+// at (watch()/unwatch()), so `tick query` output doesn't pile up in
+// every server's log around the clock.
 
 const EventEmitter = require('events');
 const pidusage = require('pidusage');
@@ -40,12 +46,22 @@ function sampleUsageWindows(pids) {
 const DEFAULT_INTERVAL_MS = 4000;
 const PING_TIMEOUT_MS = 2500;
 
-// Matches the first number after "TPS" + ":" in a console line, which
-// covers Paper/Spigot's `/tps` ("TPS from last 1m, 5m, 15m: 20.0, ..."),
-// Forge's `/forge tps` ("... Mean TPS: 20.000"), and Spark's `/spark tps`
-// output. Anything that doesn't match this shape (including vanilla's
-// "Unknown command" reply) is treated as "TPS unavailable".
-const TPS_REGEX = /TPS[^:]*:\s*\*?(-?[\d.]+)/i;
+// ~15 minutes of samples at the default 4s interval.
+const MAX_HISTORY = 225;
+
+// Vanilla `/tick query` (1.20.3+) replies with lines like:
+//   The game is running normally
+//   Target tick rate: 20.0 per second
+//   Average time per tick: 2.1ms (Target: 50.0ms)
+//   Percentiles: P50: 1.8ms P95: 3.2ms P99: 5.1ms, sample: 100
+// Group 1 = average ms per tick. Group 2 matches the reply older
+// servers give for an unknown command, so we can stop asking them.
+const TICK_REGEX = /Average time per tick:\s*([\d.]+)\s*ms|(Unknown or incomplete command)/i;
+
+// Lines that belong to the `tick query` reply. processManager hides
+// matching lines from the dashboard console for a moment after each
+// poll so they don't flood it.
+const TICK_QUIET_REGEX = /tick rate|per tick|Percentiles|running normally|game is (frozen|sprinting|stepping)|Unknown or incomplete command|<--\[HERE\]/i;
 
 class StatsPoller extends EventEmitter {
   // currentServerListFn() must return the same shape as scanServers():
@@ -56,12 +72,15 @@ class StatsPoller extends EventEmitter {
     this.currentServerListFn = currentServerListFn;
     this.tpsConfig = {
       enabled: false,
-      command: 'tps',
-      intervalMs: 10000,
+      command: 'tick query',
+      intervalMs: 5000,
       ...tpsConfig,
     };
     this.timer = null;
-    this.lastTpsPoll = new Map(); // name -> timestamp
+    this.lastTpsPoll = new Map();  // name -> timestamp
+    this.watchCounts = new Map();  // name -> number of clients viewing it
+    this.history = new Map();      // name -> { startedAt, samples: [] }
+    this.tickState = new Map();    // name -> { startedAt, unsupported }
   }
 
   start(intervalMs = DEFAULT_INTERVAL_MS) {
@@ -75,8 +94,43 @@ class StatsPoller extends EventEmitter {
     this.timer = null;
   }
 
+  // A client opened this server's detail view.
+  watch(name) {
+    const n = this.watchCounts.get(name) || 0;
+    if (n === 0) this.lastTpsPoll.delete(name); // poll TPS right away
+    this.watchCounts.set(name, n + 1);
+  }
+
+  unwatch(name) {
+    const n = (this.watchCounts.get(name) || 0) - 1;
+    if (n <= 0) this.watchCounts.delete(name);
+    else this.watchCounts.set(name, n);
+  }
+
+  getHistory(name) {
+    const h = this.history.get(name);
+    return h ? h.samples : [];
+  }
+
+  record(name, startedAt, sample) {
+    let h = this.history.get(name);
+    // New process (restart) = fresh history.
+    if (!h || h.startedAt !== startedAt) {
+      h = { startedAt, samples: [] };
+      this.history.set(name, h);
+    }
+    h.samples.push(sample);
+    if (h.samples.length > MAX_HISTORY) h.samples.shift();
+  }
+
   async tick() {
     const servers = this.currentServerListFn().filter(s => s.status === 'online');
+
+    // Forget history of servers that are no longer running.
+    const onlineNames = new Set(servers.map(s => s.name));
+    for (const name of this.history.keys()) {
+      if (!onlineNames.has(name)) this.history.delete(name);
+    }
 
     await Promise.all(servers.map((s) => this.pollOne(s)));
   }
@@ -88,11 +142,23 @@ class StatsPoller extends EventEmitter {
 
     const uptimeMs = Date.now() - info.startedAt;
 
-    const [pingResult, usage, tps] = await Promise.all([
+    // `tick` is one of:
+    //   undefined -> no new TPS data this tick (keep the old value)
+    //   null      -> TPS unavailable (disabled / unsupported / no reply)
+    //   {tps, mspt}
+    const [pingResult, usage, tick] = await Promise.all([
       mcping.ping('127.0.0.1', port, PING_TIMEOUT_MS).catch(() => null),
       this.sampleUsage(info.pid),
-      this.maybePollTps(name),
+      this.maybePollTps(name, info),
     ]);
+
+    this.record(name, info.startedAt, {
+      t: Date.now(),
+      cpu: usage ? usage.cpu : null,
+      memoryMB: usage ? usage.memoryMB : null,
+      tps: tick ? tick.tps : null,
+      mspt: tick ? tick.mspt : null,
+    });
 
     this.emit('stats', {
       server: name,
@@ -105,7 +171,9 @@ class StatsPoller extends EventEmitter {
           : null,
         icon: pingResult ? pingResult.favicon : null,
         motd: pingResult ? pingResult.motd : null,
-        tps,
+        // undefined keys vanish in JSON, so the frontend keeps its old value.
+        tps: tick ? tick.tps : tick,
+        mspt: tick ? tick.mspt : tick,
       },
     });
   }
@@ -120,7 +188,7 @@ class StatsPoller extends EventEmitter {
     if (process.platform === 'win32') {
       return sampleUsageWindows(pids);
     }
-    
+
     let stats;
     try {
       stats = await pidusage(pids);
@@ -142,24 +210,35 @@ class StatsPoller extends EventEmitter {
     };
   }
 
-  // Only actually sends the TPS command on its own (slower) cadence,
-  // since it writes to the server's stdin and we don't want to spam a
-  // command every 4 seconds. Returns null immediately if TPS polling
-  // is disabled (the default — see the comment on TPS_POLLING in
-  // server.js for how to turn it on).
-  async maybePollTps(name) {
+  // Runs `tick query` on its own cadence, and only for servers that
+  // at least one client is currently watching. TPS is capped at 20:
+  // a tick faster than 50ms just waits out the rest of its slot.
+  async maybePollTps(name, info) {
     if (!this.tpsConfig.enabled) return null;
+    if (!(this.watchCounts.get(name) > 0)) return undefined;
+
+    // Server told us it doesn't know `tick` (older than 1.20.3) —
+    // don't ask again until it's restarted.
+    const state = this.tickState.get(name);
+    if (state && state.startedAt === info.startedAt && state.unsupported) return null;
 
     const last = this.lastTpsPoll.get(name) || 0;
-    if (Date.now() - last < this.tpsConfig.intervalMs) return undefined; // "no new data this tick"
-
+    if (Date.now() - last < this.tpsConfig.intervalMs) return undefined;
     this.lastTpsPoll.set(name, Date.now());
-    const match = await this.processManager.queryConsole(name, this.tpsConfig.command, TPS_REGEX, 2000);
+
+    const match = await this.processManager.queryConsole(
+      name, this.tpsConfig.command, TICK_REGEX, 2000, TICK_QUIET_REGEX);
     if (!match) return null;
-    const value = parseFloat(match[1]);
-    return Number.isFinite(value) ? value : null;
+
+    if (match[2]) {
+      this.tickState.set(name, { startedAt: info.startedAt, unsupported: true });
+      return null;
+    }
+
+    const mspt = parseFloat(match[1]);
+    if (!Number.isFinite(mspt)) return null;
+    return { mspt, tps: mspt <= 50 ? 20 : 1000 / mspt };
   }
 }
 
 module.exports = StatsPoller;
-

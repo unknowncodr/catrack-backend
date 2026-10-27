@@ -46,11 +46,14 @@ class ProcessManager extends EventEmitter {
 
   // Sends a console command and resolves with the first subsequent
   // console line matching `regex`, or resolves null if nothing matches
-  // within timeoutMs. Used to pull TPS out of servers whose software
-  // exposes it via a command (e.g. Paper/Spigot/Forge, or a Fabric mod
-  // like Spark) — vanilla/Fabric with no such mod will just time out
-  // and resolve null, which is expected and handled upstream.
-  queryConsole(name, command, regex, timeoutMs = 2000) {
+  // within timeoutMs. Used to pull TPS/MSPT out of `tick query`.
+  //
+  // If `quietRegex` is given, any console line matching it is kept out
+  // of the dashboard console and the log buffer for a short window
+  // after the command is sent (timeoutMs + 500ms), so automated polling
+  // doesn't flood the console. The matchers still see those lines. Note
+  // the server's own latest.log still contains them.
+  queryConsole(name, command, regex, timeoutMs = 2000, quietRegex = null) {
     const entry = this.processes.get(name);
     if (!entry) return Promise.resolve(null);
 
@@ -76,6 +79,9 @@ class ProcessManager extends EventEmitter {
       }, timeoutMs);
 
       entry.pendingMatchers.push(matcher);
+      if (quietRegex) {
+        entry.quiet = { until: Date.now() + timeoutMs + 500, regex: quietRegex };
+      }
       entry.proc.stdin.write(command + '\n');
     });
   }
@@ -145,20 +151,26 @@ class ProcessManager extends EventEmitter {
     const { command, args } = this.buildLaunchCommand(serverPath, ramMB);
     const proc = spawn(command, args, { cwd: serverPath });
 
-    const entry = { proc, logs: [], startedAt: Date.now(), pendingMatchers: [] };
+    const entry = { proc, logs: [], startedAt: Date.now(), pendingMatchers: [], quiet: null };
     this.processes.set(name, entry);
 
     const pushLine = (line) => {
-      entry.logs.push(line);
-      if (entry.logs.length > MAX_LOG_LINES) entry.logs.shift();
-      this.emit('console', { server: name, line });
-
       // Give any in-flight queryConsole() calls a chance to claim this
-      // line before it's just treated as normal console output.
+      // line first, even if it's about to be hidden from the console.
       for (const matcher of entry.pendingMatchers.slice()) {
         const match = line.match(matcher.regex);
         if (match) matcher.onMatch(match);
       }
+
+      // Lines belonging to an automated query (e.g. `tick query`
+      // replies) stay out of the dashboard console.
+      if (entry.quiet && Date.now() < entry.quiet.until && entry.quiet.regex.test(line)) {
+        return;
+      }
+
+      entry.logs.push(line);
+      if (entry.logs.length > MAX_LOG_LINES) entry.logs.shift();
+      this.emit('console', { server: name, line });
     };
 
     proc.stdout.on('data', (data) => {
