@@ -1,0 +1,19 @@
+{
+  "name": "host-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "dotenv": "^18.0.9",
+    "pidusage": "^3.0.2",
+    "prismarine-nbt": "^2.8.0",
+    "ws": "^8.21.2"
+  }
+}
