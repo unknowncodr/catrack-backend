@@ -24,6 +24,7 @@ const ProcessManager = require('./processManager');
 const StatsPoller = require('./statsPoller');
 const serverConfig = require('./serverConfig');
 const { WebSocketServer } = require('ws');
+const players = require('./players');
 
 const PORT = 8067;
 
@@ -214,6 +215,33 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'get_players': {
+        if (!isKnownServer(msg.server)) {
+          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
+          break;
+        }
+        ws.send(JSON.stringify({
+          type: 'known_players',
+          server: msg.server,
+          players: players.knownPlayers(path.join(SERVERS_DIR, msg.server)),
+        }));
+        break;
+      }
+
+      case 'get_player': {
+        if (!isKnownServer(msg.server)) {
+          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
+          break;
+        }
+        players.readPlayer(path.join(SERVERS_DIR, msg.server), String(msg.uuid))
+          .then((data) => {
+            if (!data) return ws.send(JSON.stringify({ type: 'error', error: 'Invalid player id' }));
+            ws.send(JSON.stringify({ type: 'player_detail', server: msg.server, uuid: msg.uuid, data }));
+          })
+          .catch((err) => ws.send(JSON.stringify({ type: 'error', error: err.message })));
+        break;
+      }
+      
       default:
         ws.send(JSON.stringify({ type: 'error', error: `Unknown message type: ${msg.type}` }));
     }
