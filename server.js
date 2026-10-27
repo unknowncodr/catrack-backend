@@ -7,12 +7,21 @@
 //                              {type:"rescan"}
 //                              {type:"start",   server:"<name>"}
 //                              {type:"stop",    server:"<name>"}
+//                              {type:"restart", server:"<name>"}
 //                              {type:"command", server:"<name>", text:"<cmd>"}
 //                              {type:"get_logs", server:"<name>"}
+//                              {type:"set_ram",  server:"<name>", ramMB:<n|null>}
+//                              {type:"set_port", server:"<name>", port:<n>}
+//                              {type:"watch",   server:"<name>"}  (detail view opened:
+//                                  starts TPS polling, replies with "history")
+//                              {type:"unwatch"}                   (detail view closed)
 //                            Broadcasts to all connected clients:
 //                              {type:"console",      server, line}
 //                              {type:"status_change", server, status}
 //                              {type:"server_list",  servers}
+//                              {type:"stats",        server, data}
+//                            Sent to the watching client:
+//                              {type:"history", server, now, samples}
 require('dotenv').config({
   path: require('path').join(__dirname, '.env')
 });
@@ -39,19 +48,18 @@ if (!AUTH_TOKEN) {
   );
   process.exit(1);
 }
-// TPS (ticks per second) has no universal way to query it — vanilla
-// and plain Fabric servers don't expose a command for it at all. It's
-// only available if your server software/mods add a `tps` (or similar)
-// console command:
-//   - Paper / Spigot: built-in, `enabled: true, command: 'tps'` works.
-//   - Forge:          built-in, use `command: 'forge tps'`.
-//   - Fabric:         install the "Spark" mod, then `command: 'spark tps'`.
-// Left disabled by default since these servers are vanilla/Fabric —
-// the dashboard will just show TPS as unavailable until you enable it.
+
+// TPS / MSPT comes from vanilla's `/tick query` command (Minecraft
+// 1.20.3+, works on vanilla and Fabric with no mods). It's only polled
+// for servers a client currently has open in the detail view, so the
+// command doesn't run 24/7 on every server. Servers older than 1.20.3
+// reply "Unknown command" once and are then left alone until restarted.
+// The reply is hidden from the dashboard console, but the server still
+// writes it to its own latest.log.
 const TPS_POLLING = {
-  enabled: false,
-  command: 'tps',
-  intervalMs: 10000,
+  enabled: true,
+  command: 'tick query',
+  intervalMs: 5000,
 };
 
 const processManager = new ProcessManager(SERVERS_DIR);
@@ -68,7 +76,7 @@ function currentServerList() {
   return scanServers(processManager.isRunning.bind(processManager));
 }
 
-// Guards set_ram/set_port/restart from acting on a name that isn't
+// Guards set_ram/set_port/restart/watch from acting on a name that isn't
 // actually one of the scanned server folders (e.g. a stale client, or
 // a name containing "../") before it touches the filesystem.
 function isKnownServer(name) {
@@ -124,6 +132,14 @@ httpServer.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws) => {
   console.log('Client connected');
   clients.add(ws);
+  ws.watching = null; // server name this client has open in the detail view
+
+  function stopWatching() {
+    if (ws.watching) {
+      statsPoller.unwatch(ws.watching);
+      ws.watching = null;
+    }
+  }
 
   ws.send(JSON.stringify({ type: 'server_list', servers: currentServerList() }));
 
@@ -167,6 +183,29 @@ wss.on('connection', (ws) => {
           server: msg.server,
           lines: processManager.getLogs(msg.server),
         }));
+        break;
+
+      case 'watch': {
+        if (!isKnownServer(msg.server)) {
+          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
+          break;
+        }
+        if (ws.watching !== msg.server) {
+          stopWatching();
+          statsPoller.watch(msg.server);
+          ws.watching = msg.server;
+        }
+        ws.send(JSON.stringify({
+          type: 'history',
+          server: msg.server,
+          now: Date.now(),
+          samples: statsPoller.getHistory(msg.server),
+        }));
+        break;
+      }
+
+      case 'unwatch':
+        stopWatching();
         break;
 
       case 'restart': {
@@ -241,7 +280,7 @@ wss.on('connection', (ws) => {
           .catch((err) => ws.send(JSON.stringify({ type: 'error', error: err.message })));
         break;
       }
-      
+
       default:
         ws.send(JSON.stringify({ type: 'error', error: `Unknown message type: ${msg.type}` }));
     }
@@ -249,6 +288,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log('Client disconnected');
+    stopWatching();
     clients.delete(ws);
   });
 });
