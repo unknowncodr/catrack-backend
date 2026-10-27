@@ -167,7 +167,15 @@ class StatsPoller extends EventEmitter {
         cpu: usage ? usage.cpu : null,
         memoryMB: usage ? usage.memoryMB : null,
         players: pingResult
-          ? { online: pingResult.online, max: pingResult.max, sample: pingResult.sample }
+          ? {
+            online: pingResult.online,
+            max: pingResult.max,
+            sample: pingResult.sample.map((player) => (
+              player && typeof player === 'object'
+                ? { ...player, uuid: player.uuid ?? player.id }
+                : player
+            )),
+          }
           : null,
         icon: pingResult ? pingResult.favicon : null,
         motd: pingResult ? pingResult.motd : null,
