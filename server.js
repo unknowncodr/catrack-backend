@@ -2,26 +2,31 @@
 // and send console commands, and streams live console output.
 //
 //   GET  /status         -> plain health check, no auth
-//   WS   /ws?token=...   -> authenticated. On connect sends the current
-//                            server list. Accepts JSON messages:
+//   WS   /ws?token=...   -> authenticated. On connect sends {type:"permissions"}
+//                            then the server list (filtered to what the token
+//                            may see). Accepts JSON messages:
 //                              {type:"rescan"}
-//                              {type:"start",   server:"<name>"}
-//                              {type:"stop",    server:"<name>"}
-//                              {type:"restart", server:"<name>"}
-//                              {type:"command", server:"<name>", text:"<cmd>"}
-//                              {type:"get_logs", server:"<name>"}
-//                              {type:"set_ram",  server:"<name>", ramMB:<n|null>}
-//                              {type:"set_port", server:"<name>", port:<n>}
-//                              {type:"watch",   server:"<name>"}  (detail view opened:
-//                                  starts TPS polling, replies with "history")
-//                              {type:"unwatch"}                   (detail view closed)
-//                            Broadcasts to all connected clients:
+//                              {type:"start",   server:"<name>"}   (admin)
+//                              {type:"stop",    server:"<name>"}   (admin)
+//                              {type:"restart", server:"<name>"}   (admin)
+//                              {type:"command", server:"<name>", text:"<cmd>"}  (console)
+//                              {type:"get_logs", server:"<name>"}  (console)
+//                              {type:"set_ram",  server:"<name>", ramMB:<n|null>}  (admin)
+//                              {type:"set_port", server:"<name>", port:<n>}        (admin)
+//                              {type:"get_players"/"get_player", ...}
+//                              {type:"watch",   server:"<name>"}
+//                              {type:"unwatch"}
+//                            Pushed to each client, only for servers its token
+//                            may see ("console" also needs the console perm):
 //                              {type:"console",      server, line}
 //                              {type:"status_change", server, status}
 //                              {type:"server_list",  servers}
 //                              {type:"stats",        server, data}
+//                              {type:"permissions",  label, servers, console, admin}
 //                            Sent to the watching client:
 //                              {type:"history", server, now, samples}
+//
+// Tokens and their permissions are configured in .env, see auth.js.
 require('dotenv').config({
   path: require('path').join(__dirname, '.env')
 });
@@ -34,17 +39,16 @@ const StatsPoller = require('./statsPoller');
 const serverConfig = require('./serverConfig');
 const { WebSocketServer } = require('ws');
 const players = require('./players');
+const auth = require('./auth');
 
 const PORT = 8067;
 
-// CHANGE THIS before exposing the tunnel to anyone but yourself.
-// Later this should be a hashed secret loaded from a config/env file,
-// not a plaintext string in the source.
-const AUTH_TOKEN = process.env.AGENT_TOKEN;
+const { tokens: TOKENS, warnings: TOKEN_WARNINGS } = auth.loadTokens(process.env);
+TOKEN_WARNINGS.forEach((w) => console.warn(`WARNING: ${w}`));
 
-if (!AUTH_TOKEN) {
+if (TOKENS.length === 0) {
   console.error(
-    'ERROR: AGENT_TOKEN is missing. Check the .env file in the host-agent folder.'
+    'ERROR: No valid tokens found. Set AGENT_TOKEN (and optionally AGENT_TOKEN_<name>) in the .env file in the host-agent folder.'
   );
   process.exit(1);
 }
@@ -65,10 +69,15 @@ const TPS_POLLING = {
 const processManager = new ProcessManager(SERVERS_DIR);
 const clients = new Set();
 
-function broadcast(message) {
+function send(ws, message) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
+}
+
+// Sends to every client whose token passes `allow(auth)`.
+function broadcast(message, allow = () => true) {
   const payload = JSON.stringify(message);
   for (const ws of clients) {
-    if (ws.readyState === ws.OPEN) ws.send(payload);
+    if (ws.readyState === ws.OPEN && allow(ws.auth)) ws.send(payload);
   }
 }
 
@@ -76,24 +85,52 @@ function currentServerList() {
   return scanServers(processManager.isRunning.bind(processManager));
 }
 
-// Guards set_ram/set_port/restart/watch from acting on a name that isn't
-// actually one of the scanned server folders (e.g. a stale client, or
-// a name containing "../") before it touches the filesystem.
-function isKnownServer(name) {
-  return currentServerList().some((s) => s.name === name);
+// The server list as one particular token is allowed to see it.
+function serverListFor(a) {
+  return currentServerList().filter((s) => auth.canSee(a, s.name));
 }
 
-// Any console line or status change from any server goes out to every
-// connected client — the frontend filters to whichever server view is
-// currently open.
-processManager.on('console', (msg) => broadcast({ type: 'console', ...msg }));
+function sendServerList(ws) {
+  send(ws, { type: 'server_list', servers: serverListFor(ws.auth) });
+}
+
+function broadcastServerList() {
+  for (const ws of clients) sendServerList(ws);
+}
+
+// Guards every server-specific action: the name must be a real scanned
+// server folder (blocks "../" etc.) AND the token must be allowed to see
+// it. Restricted tokens get the same "Unknown server" answer for a
+// server that exists but is hidden from them, so names don't leak.
+// `need` is 'console' or 'admin' for actions beyond plain viewing.
+function authorize(ws, serverName, need = null) {
+  if (!currentServerList().some((s) => s.name === serverName) || !auth.canSee(ws.auth, serverName)) {
+    send(ws, { type: 'error', error: 'Unknown server' });
+    return false;
+  }
+  if (need && !ws.auth[need]) {
+    send(ws, { type: 'error', error: `Your token does not have ${need} permission` });
+    return false;
+  }
+  return true;
+}
+
+// Console lines need the console permission as well as access to the
+// server (they contain chat, IPs, commands...).
+processManager.on('console', (msg) => broadcast(
+  { type: 'console', ...msg },
+  (a) => a.console && auth.canSee(a, msg.server),
+));
 processManager.on('status_change', (msg) => {
-  broadcast({ type: 'status_change', ...msg });
-  broadcast({ type: 'server_list', servers: currentServerList() });
+  broadcast({ type: 'status_change', ...msg }, (a) => auth.canSee(a, msg.server));
+  broadcastServerList();
 });
 
 const statsPoller = new StatsPoller(processManager, currentServerList, TPS_POLLING);
-statsPoller.on('stats', (msg) => broadcast({ type: 'stats', server: msg.server, data: msg.data }));
+statsPoller.on('stats', (msg) => broadcast(
+  { type: 'stats', server: msg.server, data: msg.data },
+  (a) => auth.canSee(a, msg.server),
+));
 
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/status') {
@@ -116,8 +153,8 @@ httpServer.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  const token = url.searchParams.get('token');
-  if (token !== AUTH_TOKEN) {
+  const tokenEntry = auth.authenticate(TOKENS, url.searchParams.get('token'));
+  if (!tokenEntry) {
     console.log('Rejected WebSocket connection: bad or missing token');
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
@@ -125,12 +162,13 @@ httpServer.on('upgrade', (req, socket, head) => {
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
+    ws.auth = tokenEntry;
     wss.emit('connection', ws, req);
   });
 });
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  console.log(`Client connected (token: ${ws.auth.label})`);
   clients.add(ws);
   ws.watching = null; // server name this client has open in the detail view
 
@@ -141,66 +179,68 @@ wss.on('connection', (ws) => {
     }
   }
 
-  ws.send(JSON.stringify({ type: 'server_list', servers: currentServerList() }));
+  send(ws, { type: 'permissions', ...auth.describe(ws.auth) });
+  sendServerList(ws);
 
   ws.on('message', (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
     } catch {
-      ws.send(JSON.stringify({ type: 'error', error: 'Invalid JSON' }));
+      send(ws, { type: 'error', error: 'Invalid JSON' });
       return;
     }
 
-    console.log('Received:', msg);
+    console.log(`Received (${ws.auth.label}):`, msg);
 
     switch (msg.type) {
       case 'rescan':
-        ws.send(JSON.stringify({ type: 'server_list', servers: currentServerList() }));
+        sendServerList(ws);
         break;
 
       case 'start': {
+        if (!authorize(ws, msg.server, 'admin')) break;
         const result = processManager.start(msg.server);
-        if (!result.ok) ws.send(JSON.stringify({ type: 'error', error: result.error }));
+        if (!result.ok) send(ws, { type: 'error', error: result.error });
         break;
       }
 
       case 'stop': {
+        if (!authorize(ws, msg.server, 'admin')) break;
         const result = processManager.stop(msg.server);
-        if (!result.ok) ws.send(JSON.stringify({ type: 'error', error: result.error }));
+        if (!result.ok) send(ws, { type: 'error', error: result.error });
         break;
       }
 
       case 'command': {
+        if (!authorize(ws, msg.server, 'console')) break;
         const result = processManager.sendCommand(msg.server, msg.text);
-        if (!result.ok) ws.send(JSON.stringify({ type: 'error', error: result.error }));
+        if (!result.ok) send(ws, { type: 'error', error: result.error });
         break;
       }
 
       case 'get_logs':
-        ws.send(JSON.stringify({
+        if (!authorize(ws, msg.server, 'console')) break;
+        send(ws, {
           type: 'log_history',
           server: msg.server,
           lines: processManager.getLogs(msg.server),
-        }));
+        });
         break;
 
       case 'watch': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
+        if (!authorize(ws, msg.server)) break;
         if (ws.watching !== msg.server) {
           stopWatching();
           statsPoller.watch(msg.server);
           ws.watching = msg.server;
         }
-        ws.send(JSON.stringify({
+        send(ws, {
           type: 'history',
           server: msg.server,
           now: Date.now(),
           samples: statsPoller.getHistory(msg.server),
-        }));
+        });
         break;
       }
 
@@ -209,20 +249,14 @@ wss.on('connection', (ws) => {
         break;
 
       case 'restart': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
+        if (!authorize(ws, msg.server, 'admin')) break;
         const result = processManager.restart(msg.server);
-        if (!result.ok) ws.send(JSON.stringify({ type: 'error', error: result.error }));
+        if (!result.ok) send(ws, { type: 'error', error: result.error });
         break;
       }
 
       case 'set_ram': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
+        if (!authorize(ws, msg.server, 'admin')) break;
         // null/blank clears the override and falls back to start.bat/
         // run.bat/plain java — see serverConfig.js and the comment on
         // buildLaunchCommand for what that tradeoff means.
@@ -230,59 +264,50 @@ wss.on('connection', (ws) => {
         if (msg.ramMB !== null && msg.ramMB !== '' && msg.ramMB !== undefined) {
           ramMB = Number(msg.ramMB);
           if (!Number.isFinite(ramMB) || ramMB < 512 || ramMB > 65536) {
-            ws.send(JSON.stringify({ type: 'error', error: 'RAM must be between 512 and 65536 MB' }));
+            send(ws, { type: 'error', error: 'RAM must be between 512 and 65536 MB' });
             break;
           }
         }
         serverConfig.setRamMB(path.join(SERVERS_DIR, msg.server), ramMB);
-        broadcast({ type: 'server_list', servers: currentServerList() });
+        broadcastServerList();
         break;
       }
 
       case 'set_port': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
+        if (!authorize(ws, msg.server, 'admin')) break;
         const port = Number(msg.port);
         if (!Number.isInteger(port) || port < 1 || port > 65535) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Port must be between 1 and 65535' }));
+          send(ws, { type: 'error', error: 'Port must be between 1 and 65535' });
           break;
         }
         serverConfig.setPort(path.join(SERVERS_DIR, msg.server), port);
-        broadcast({ type: 'server_list', servers: currentServerList() });
+        broadcastServerList();
         break;
       }
 
       case 'get_players': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
-        ws.send(JSON.stringify({
+        if (!authorize(ws, msg.server)) break;
+        send(ws, {
           type: 'known_players',
           server: msg.server,
           players: players.knownPlayers(path.join(SERVERS_DIR, msg.server)),
-        }));
+        });
         break;
       }
 
       case 'get_player': {
-        if (!isKnownServer(msg.server)) {
-          ws.send(JSON.stringify({ type: 'error', error: 'Unknown server' }));
-          break;
-        }
+        if (!authorize(ws, msg.server)) break;
         players.readPlayer(path.join(SERVERS_DIR, msg.server), String(msg.uuid))
           .then((data) => {
-            if (!data) return ws.send(JSON.stringify({ type: 'error', error: 'Invalid player id' }));
-            ws.send(JSON.stringify({ type: 'player_detail', server: msg.server, uuid: msg.uuid, data }));
+            if (!data) return send(ws, { type: 'error', error: 'Invalid player id' });
+            send(ws, { type: 'player_detail', server: msg.server, uuid: msg.uuid, data });
           })
-          .catch((err) => ws.send(JSON.stringify({ type: 'error', error: err.message })));
+          .catch((err) => send(ws, { type: 'error', error: err.message }));
         break;
       }
 
       default:
-        ws.send(JSON.stringify({ type: 'error', error: `Unknown message type: ${msg.type}` }));
+        send(ws, { type: 'error', error: `Unknown message type: ${msg.type}` });
     }
   });
 
@@ -298,6 +323,11 @@ httpServer.listen(PORT, () => {
   console.log(`Found: ${currentServerList().map(s => s.name).join(', ') || '(none)'}`);
   console.log(`Host agent listening on http://localhost:${PORT}`);
   console.log(`  HTTP status check: http://localhost:${PORT}/status`);
-  console.log(`  WebSocket:         ws://localhost:${PORT}/ws?token=${AUTH_TOKEN}`);
+  console.log(`  WebSocket:         ws://localhost:${PORT}/ws?token=<token>`);
+  console.log('Tokens loaded:');
+  for (const t of TOKENS) {
+    const d = auth.describe(t);
+    console.log(`  ${d.label}: servers=${d.servers === '*' ? '*' : d.servers.join(',')} console=${d.console} admin=${d.admin}`);
+  }
   statsPoller.start();
 });
